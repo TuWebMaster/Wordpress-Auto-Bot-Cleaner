@@ -1,63 +1,227 @@
-# Auto Bot Cleaner
+if ( ! defined( 'ABSPATH' ) ) exit;
 
-**Auto Bot Cleaner** es un snippet PHP para WordPress que permite identificar y eliminar automáticamente usuarios sospechosos (bots) basándose en la longitud de los campos de registro y roles asignados. Esta herramienta limpia registros automáticos no deseados sin afectar a los usuarios reales.
+/**
+ * Auto Bot Cleaner
+ * Limpiar Bots por longitud (solo AUTO-borrado por tandas)
+ * - Campos medidos individualmente: user_login, display_name, user_nicename, first_name, last_name, nickname
+ * - Backend: mínimo de caracteres, roles, tamaño de tanda
+ * - Pre-Scan (conteo)
+ * - Auto-borrado por tandas con progreso (JS auto-submit)
+ * - Sin borrado manual, sin reporte por tanda
+ */
 
----
+add_action('admin_menu', function() {
+    add_users_page(
+        'Auto Bot Cleaner',
+        'Auto Bot Cleaner',
+        'manage_options',
+        'auto-bot-cleaner',
+        'twm_limpiar_bots_len_page'
+    );
+});
 
-## Características
+function twm_build_role_join_where($roles_csv, &$params) {
+    global $wpdb;
+    $roles = array_filter(array_map('trim', explode(',', (string)$roles_csv)));
+    $join  = "";
+    $where = "";
+    if (!empty($roles)) {
+        $join  = " INNER JOIN {$wpdb->usermeta} umcap ON umcap.user_id = u.ID AND umcap.meta_key = %s ";
+        $params[] = $wpdb->prefix . 'capabilities';
+        $likes = [];
+        foreach ($roles as $r) {
+            $likes[]  = " umcap.meta_value LIKE %s ";
+            $params[] = '%' . $r . '%';
+        }
+        $where = " AND (" . implode(' OR ', $likes) . ") ";
+    }
+    return [$join, $where];
+}
 
-- Escanea usuarios por longitud de campos: `user_login`, `display_name`, `user_nicename`, `first_name`, `last_name`, `nickname`.
-- Permite definir roles específicos a revisar (por ejemplo, `subscriber`, `customer`).
-- Pre-Scan: muestra cuántos usuarios cumplen con los criterios antes de borrarlos.
-- Auto-borrado por tandas con límite configurable (`batch_size`) y seguimiento en tiempo real.
-- Protección para evitar borrar al usuario administrador actual.
-- Interfaz simple dentro del backend de WordPress.
+function twm_len_condition_sql(&$params, $min_chars) {
+    $sources = [
+        "CHAR_LENGTH(u.user_login) >= %d",
+        "CHAR_LENGTH(u.display_name) >= %d",
+        "CHAR_LENGTH(u.user_nicename) >= %d",
+        "CHAR_LENGTH(COALESCE(um_fn.meta_value,'')) >= %d",
+        "CHAR_LENGTH(COALESCE(um_ln.meta_value,'')) >= %d",
+        "CHAR_LENGTH(COALESCE(um_nn.meta_value,'')) >= %d",
+    ];
+    foreach ($sources as $s) { $params[] = $min_chars; }
+    return ' AND (' . implode(' OR ', $sources) . ') ';
+}
 
----
+function twm_limpiar_bots_len_page() {
+    global $wpdb;
 
-## Cómo usarlo
+    // Parámetros UI
+    $min_chars   = isset($_POST['min_chars'])   ? max(1, (int)$_POST['min_chars']) : 30;
+    $batch_size  = isset($_POST['batch_size'])  ? max(1, (int)$_POST['batch_size']) : 200;
+    $roles_csv   = isset($_POST['roles_csv'])   ? sanitize_text_field($_POST['roles_csv']) : 'subscriber,customer';
+    $do_prescan  = isset($_POST['do_prescan']);
+    $do_auto     = isset($_POST['do_auto']);
+    $auto_total  = (int) get_transient('twm_lb_auto_deleted_total') ?: 0;
 
-### Opción 1: Insertar como snippet
-1. Instala un plugin para gestionar snippets, como [Code Snippets](https://wordpress.org/plugins/code-snippets/).
-2. Crea un nuevo snippet y pega el código de **Auto Bot Cleaner**.
-3. Guarda y activa el snippet.  
+    // Joins de metadatos de nombre
+    $join_meta = "
+        LEFT JOIN {$wpdb->usermeta} um_fn ON um_fn.user_id = u.ID AND um_fn.meta_key = 'first_name'
+        LEFT JOIN {$wpdb->usermeta} um_ln ON um_ln.user_id = u.ID AND um_ln.meta_key = 'last_name'
+        LEFT JOIN {$wpdb->usermeta} um_nn ON um_nn.user_id = u.ID AND um_nn.meta_key = 'nickname'
+    ";
 
-### Opción 2: Crear un plugin
-1. Crea un archivo PHP con el código de **Auto Bot Cleaner** (por ejemplo, `auto-bot-cleaner.php`).
-2. Comprime el archivo en un ZIP (`auto-bot-cleaner.zip`).
-3. Instálalo desde WordPress: `Plugins > Añadir nuevo > Subir plugin`.
-4. Activa el plugin.
+    // Estilos mínimos (aviso rojo)
+    echo '<div class="wrap"><h1>Auto Bot Cleaner</h1>';
+    echo '<style>.twm-auto-announce{color:#b32d2e;font-weight:700;}</style>';
 
----
+    // === PRE-SCAN: conteo con criterios actuales ===
+    $params_c = [];
+    [$join_roles_c, $where_roles_c] = twm_build_role_join_where($roles_csv, $params_c);
+    $len_sql_c = twm_len_condition_sql($params_c, $min_chars);
+    $sql_count = "
+        SELECT COUNT(*)
+        FROM {$wpdb->users} u
+        {$join_roles_c}
+        {$join_meta}
+        WHERE 1=1
+        {$where_roles_c}
+        {$len_sql_c}
+    ";
+    $remaining_before = (int)$wpdb->get_var($wpdb->prepare($sql_count, ...$params_c));
 
-## Dónde encontrarlo en WordPress
+    if ( $do_auto && check_admin_referer('twm_lb_len') ) {
+        // === AUTO: borrar una tanda con límite batch_size ===
+        $params = [];
+        [$join_roles, $where_roles] = twm_build_role_join_where($roles_csv, $params);
+        $len_sql = twm_len_condition_sql($params, $min_chars);
 
-Una vez activo, la opción estará disponible en el menú de administración:
+        $sql = "
+            SELECT u.ID
+            FROM {$wpdb->users} u
+            {$join_roles}
+            {$join_meta}
+            WHERE 1=1
+            {$where_roles}
+            {$len_sql}
+            ORDER BY
+              GREATEST(
+                CHAR_LENGTH(u.user_login),
+                CHAR_LENGTH(u.display_name),
+                CHAR_LENGTH(u.user_nicename),
+                CHAR_LENGTH(COALESCE(um_fn.meta_value,'')),
+                CHAR_LENGTH(COALESCE(um_ln.meta_value,'')),
+                CHAR_LENGTH(COALESCE(um_nn.meta_value,'')),
+              ) DESC
+            LIMIT %d
+        ";
+        $params[] = $batch_size;
 
-**Usuarios > Auto Bot Cleaner**
+        $rows = $wpdb->get_results($wpdb->prepare($sql, ...$params));
+        $deleted_this_batch = 0;
 
-Desde allí podrás:
+        if (!empty($rows)) {
+            $current_user_id = get_current_user_id();
+            foreach ($rows as $u) {
+                if ((int)$u->ID === $current_user_id) continue; // no borrarte a vos
+                if (wp_delete_user((int)$u->ID)) {
+                    $deleted_this_batch++;
+                }
+            }
+            // acumular progreso
+            $auto_total += $deleted_this_batch;
+            set_transient('twm_lb_auto_deleted_total', $auto_total, 60*10); // 10 min
+        }
+    }
 
-- Configurar el mínimo de caracteres para identificar bots.
-- Seleccionar los roles a revisar.
-- Definir la cantidad de usuarios por tanda (`batch_size`).
-- Ejecutar **Pre-Scan** o **Auto-borrado por tandas**.
+    // Recalcular restantes tras el borrado (o tras el pre-scan)
+    $params_c2 = [];
+    [$join_roles_c2, $where_roles_c2] = twm_build_role_join_where($roles_csv, $params_c2);
+    $len_sql_c2 = twm_len_condition_sql($params_c2, $min_chars);
+    $sql_count2 = "
+        SELECT COUNT(*)
+        FROM {$wpdb->users} u
+        {$join_roles_c2}
+        {$join_meta}
+        WHERE 1=1
+        {$where_roles_c2}
+        {$len_sql_c2}
+    ";
+    $remaining_after = (int)$wpdb->get_var($wpdb->prepare($sql_count2, ...$params_c2));
 
----
+    // === Formulario principal (sin inputs ocultos que pisen valores) ===
+    ?>
+    <form method="post" style="margin-bottom:16px;">
+        <?php wp_nonce_field('twm_lb_len'); ?>
+        <table class="form-table">
+            <tr>
+                <th><label for="min_chars">Mínimo de caracteres</label></th>
+                <td><input type="number" id="min_chars" name="min_chars" value="<?php echo esc_attr($min_chars); ?>" min="1" step="1"></td>
+            </tr>
+            <tr>
+                <th><label for="roles_csv">Roles a revisar</label></th>
+                <td>
+                    <input type="text" id="roles_csv" name="roles_csv" value="<?php echo esc_attr($roles_csv); ?>" style="width:320px">
+                    <p class="description">Ej: <code>subscriber,customer</code>. Vacío = todos los roles.</p>
+                </td>
+            </tr>
+            <tr>
+                <th><label for="batch_size">Usuarios por tanda</label></th>
+                <td><input type="number" id="batch_size" name="batch_size" value="<?php echo esc_attr($batch_size); ?>" min="1" step="1"></td>
+            </tr>
+        </table>
+        <p>
+            <button class="button button-secondary" name="do_prescan" value="1">Pre-Scan</button>
+            <button class="button"                  name="do_auto"    value="1">Auto-borrar todo por tandas</button>
+        </p>
+    </form>
+    <?php
 
-## Cómo funciona
+    // Feedback de Pre-Scan (si se apretó ese botón)
+    if ( $do_prescan ) {
+        echo '<div class="notice notice-info"><p>Pre-Scan aplicado con <strong>mínimo '
+            . esc_html($min_chars) . ' caracteres</strong> y roles: '
+            . esc_html($roles_csv ?: 'todos') . '.</p></div>';
+    }
 
-Esta herramienta nació de la necesidad de eliminar bots registrados en WordPress que compartían un patrón: presencia de publicidad o contenido sospechoso en alguno de los campos del registro. Para diferenciarlos de los usuarios reales, se utiliza un contador de caracteres en campos clave, permitiendo eliminar únicamente los registros sospechosos.
+    // Resultados visibles
+    echo '<h2>Resultados</h2>';
+    echo '<p>Usuarios que cumplen el criterio: <strong>' . number_format_i18n($remaining_after) . '</strong></p>';
 
----
+    // === Estado del AUTO-borrado ===
+    if ($do_auto) {
+        if ($remaining_after > 0) {
+            // Aviso y relanzar próxima tanda
+            echo '<p class="twm-auto-announce"><strong>Auto-borrado en curso…</strong> Eliminados hasta ahora: '
+                . number_format_i18n($auto_total) . '. Restantes estimados: '
+                . number_format_i18n($remaining_after) . '.</p>';
+            ?>
+            <form id="twm-auto-form" method="post">
+                <?php wp_nonce_field('twm_lb_len'); ?>
+                <input type="hidden" name="min_chars"  value="<?php echo esc_attr($min_chars); ?>">
+                <input type="hidden" name="roles_csv"  value="<?php echo esc_attr($roles_csv); ?>">
+                <input type="hidden" name="batch_size" value="<?php echo esc_attr($batch_size); ?>">
+                <input type="hidden" name="do_auto"    value="1">
+            </form>
+            <script>
+            // reenviar en 1200 ms para la próxima tanda
+            setTimeout(function(){ document.getElementById('twm-auto-form').submit(); }, 1200);
+            </script>
+            <?php
+        } else {
+            // Fin del proceso
+            $done_total = (int) $auto_total;
+            delete_transient('twm_lb_auto_deleted_total');
+            echo '<div class="notice notice-success"><p><strong>Auto-borrado completado.</strong> Total eliminados: '
+                . number_format_i18n($done_total) . '.</p></div>';
+        }
+    }
+// === Texto explicativo y créditos ===
+echo '<div style="margin-top:20px; padding:12px; border:1px solid #ccc; background:#f9f9f9;">';
+echo '<h2>Acerca de Auto Bot Cleaner</h2>';
+echo '<p>Esta herramienta nació de la necesidad de borrar bots registrados en WordPress que compartían como patrón la presencia de publicidad o contenido sospechoso en alguno de los campos del registro. Para diferenciarlos de los usuarios reales, se utiliza un contador de caracteres en campos clave, permitiendo eliminar únicamente los registros sospechosos sin afectar cuentas legítimas.</p>';
+echo '<p>Si necesitas adaptar esta herramienta a tus necesidades específicas, comunicate con <a href="https://www.tuwebmaster.com.ar" target="_blank">www.tuwebmaster.com.ar</a>.</p>';
+echo '<p style="font-size:12px; color:#666;">&copy; ' . date('Y') . ' TuWebmaster. Todos los derechos reservados.</p>';
+echo '</div>';
 
-## Créditos
+    echo '</div>'; // .wrap
+}
 
-Desarrollado por [TuWebmaster](https://www.tuwebmaster.com.ar).  
-Si necesitas adaptar esta herramienta a tus necesidades específicas, comunicate con nosotros.
-
----
-
-## Licencia
-
-Disponible bajo [MIT License](https://opensource.org/licenses/MIT) o la licencia que prefieras aplicar.
