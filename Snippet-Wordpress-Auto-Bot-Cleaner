@@ -2,12 +2,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
 
 /**
  * Auto Bot Cleaner
- * Limpiar Bots por longitud (solo AUTO-borrado por tandas)
- * - Campos medidos individualmente: user_login, display_name, user_nicename, first_name, last_name, nickname
- * - Backend: mínimo de caracteres, roles, tamaño de tanda
- * - Pre-Scan (conteo)
- * - Auto-borrado por tandas con progreso (JS auto-submit)
- * - Sin borrado manual, sin reporte por tanda
+ * Herramienta para limpiar usuarios automáticamente por longitud de campos
  */
 
 add_action('admin_menu', function() {
@@ -62,6 +57,10 @@ function twm_limpiar_bots_len_page() {
     $do_auto     = isset($_POST['do_auto']);
     $auto_total  = (int) get_transient('twm_lb_auto_deleted_total') ?: 0;
 
+    // === NUEVO: detectar "contexto de auto-borrado" ===
+    // Solo consideramos contexto si venimos de "Auto-borrar" o de un reenvío interno entre tandas.
+    $in_auto_context = ( isset($_POST['do_auto']) || isset($_POST['twm_auto_loop']) );
+
     // Joins de metadatos de nombre
     $join_meta = "
         LEFT JOIN {$wpdb->usermeta} um_fn ON um_fn.user_id = u.ID AND um_fn.meta_key = 'first_name'
@@ -69,7 +68,6 @@ function twm_limpiar_bots_len_page() {
         LEFT JOIN {$wpdb->usermeta} um_nn ON um_nn.user_id = u.ID AND um_nn.meta_key = 'nickname'
     ";
 
-    // Estilos mínimos (aviso rojo)
     echo '<div class="wrap"><h1>Auto Bot Cleaner</h1>';
     echo '<style>.twm-auto-announce{color:#b32d2e;font-weight:700;}</style>';
 
@@ -87,6 +85,42 @@ function twm_limpiar_bots_len_page() {
         {$len_sql_c}
     ";
     $remaining_before = (int)$wpdb->get_var($wpdb->prepare($sql_count, ...$params_c));
+
+    // Mostrar mensaje de carga inicial si es la primera tanda
+    if ($do_auto && !isset($_POST['twm_auto_loop'])) {
+        echo '<div class="notice notice-info">';
+        echo '<p>🔄 <strong>Preparando la limpieza automática...</strong></p>';
+        echo '<p>El proceso comenzará en breve. Por favor espera mientras preparamos todo.</p>';
+        echo '<p>Podrás ver el progreso en unos momentos.</p>';
+        echo '</div>';
+        
+        // Configurar el formulario para la primera ejecución
+        ?>
+        <form id="twm-auto-form" method="post">
+            <?php wp_nonce_field('twm_lb_len'); ?>
+            <input type="hidden" name="min_chars" value="<?php echo esc_attr($min_chars); ?>">
+            <input type="hidden" name="roles_csv" value="<?php echo esc_attr($roles_csv); ?>">
+            <input type="hidden" name="batch_size" value="<?php echo esc_attr($batch_size); ?>">
+            <input type="hidden" name="do_auto" value="1">
+            <input type="hidden" name="twm_auto_loop" value="1">
+        </form>
+        <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Desplazarse al área de mensajes
+            const notice = document.querySelector('.notice');
+            if (notice) {
+                notice.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+            // Enviar formulario después de un breve retraso
+            setTimeout(function() {
+                document.getElementById('twm-auto-form').submit();
+            }, 1000);
+        });
+        </script>
+        <?php
+        echo '</div>'; // .wrap
+        return;
+    }
 
     if ( $do_auto && check_admin_referer('twm_lb_len') ) {
         // === AUTO: borrar una tanda con límite batch_size ===
@@ -109,7 +143,7 @@ function twm_limpiar_bots_len_page() {
                 CHAR_LENGTH(u.user_nicename),
                 CHAR_LENGTH(COALESCE(um_fn.meta_value,'')),
                 CHAR_LENGTH(COALESCE(um_ln.meta_value,'')),
-                CHAR_LENGTH(COALESCE(um_nn.meta_value,'')),
+                CHAR_LENGTH(COALESCE(um_nn.meta_value,''))
               ) DESC
             LIMIT %d
         ";
@@ -129,6 +163,8 @@ function twm_limpiar_bots_len_page() {
             // acumular progreso
             $auto_total += $deleted_this_batch;
             set_transient('twm_lb_auto_deleted_total', $auto_total, 60*10); // 10 min
+            // mantener bandera de "en curso" activa durante el loop
+            set_transient('twm_lb_auto_running', 1, 60*10);
         }
     }
 
@@ -147,7 +183,7 @@ function twm_limpiar_bots_len_page() {
     ";
     $remaining_after = (int)$wpdb->get_var($wpdb->prepare($sql_count2, ...$params_c2));
 
-    // === Formulario principal (sin inputs ocultos que pisen valores) ===
+    // === Formulario principal ===
     ?>
     <form method="post" style="margin-bottom:16px;">
         <?php wp_nonce_field('twm_lb_len'); ?>
@@ -182,17 +218,73 @@ function twm_limpiar_bots_len_page() {
             . esc_html($roles_csv ?: 'todos') . '.</p></div>';
     }
 
-    // Resultados visibles
     echo '<h2>Resultados</h2>';
     echo '<p>Usuarios que cumplen el criterio: <strong>' . number_format_i18n($remaining_after) . '</strong></p>';
 
-    // === Estado del AUTO-borrado ===
+    // Mostrar progreso después de la primera tanda
+    if ($do_auto && isset($_POST['twm_auto_loop'])) {
+        if ($remaining_after > 0) {
+            // Calcular porcentaje completado
+            $total_processed = $auto_total + $remaining_after;
+            $progress_percent = $total_processed > 0 ? 
+                min(100, round(($auto_total / $total_processed) * 100)) : 0;
+            
+            echo '<div class="notice notice-info">';
+            echo '<h3>🔄 Procesando limpieza automática</h3>';
+            echo '<p>Por favor espera mientras se completan las operaciones.</p>';
+            echo '<div style="background: #f0f0f1; height: 20px; border-radius: 10px; margin: 10px 0; overflow: hidden;">';
+            echo '<div style="background: #2271b1; height: 100%; width: ' . esc_attr($progress_percent) . '%; transition: width 0.3s ease-in-out;"></div>';
+            echo '</div>';
+            echo '<p>Progreso: <strong>' . number_format_i18n($progress_percent) . '%</strong> (' . number_format_i18n($auto_total) . ' de ~' . number_format_i18n($total_processed) . ' usuarios procesados)</p>';
+            echo '<p>Usuarios eliminados en esta sesión: <strong>' . number_format_i18n($auto_total) . '</strong></p>';
+            echo '<p>Usuarios restantes: <strong>' . number_format_i18n($remaining_after) . '</strong></p>';
+            echo '</div>';
+            
+            // Formulario para la siguiente tanda
+            ?>
+            <form id="twm-auto-form" method="post">
+                <?php wp_nonce_field('twm_lb_len'); ?>
+                <input type="hidden" name="min_chars" value="<?php echo esc_attr($min_chars); ?>">
+                <input type="hidden" name="roles_csv" value="<?php echo esc_attr($roles_csv); ?>">
+                <input type="hidden" name="batch_size" value="<?php echo esc_attr($batch_size); ?>">
+                <input type="hidden" name="do_auto" value="1">
+                <input type="hidden" name="twm_auto_loop" value="1">
+            </form>
+            <script>
+            document.addEventListener('DOMContentLoaded', function() {
+                // Desplazarse al área de progreso
+                const notice = document.querySelector('.notice');
+                if (notice) {
+                    notice.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+                // Enviar formulario después de 1.2 segundos
+                setTimeout(function() {
+                    document.getElementById('twm-auto-form').submit();
+                }, 1200);
+            });
+            </script>
+            <?php
+        } else {
+            // Proceso completado
+            delete_transient('twm_lb_auto_deleted_total');
+            echo '<div class="notice notice-success">';
+            echo '<h3>✅ Proceso de limpieza completado</h3>';
+            echo '<p>Se han eliminado <strong>' . number_format_i18n($auto_total) . '</strong> usuarios que coincidían con los criterios de búsqueda.</p>';
+            echo '</div>';
+        }
+    }
+
+    // Si hay transient pero NO estamos en contexto (refresh manual o visita nueva),
+    // no mostramos el banner para evitar confusión.
+    // Opcional: podrías limpiar el transient si no hay pendientes.
+    if ( ! $in_auto_context && get_transient('twm_lb_auto_running') && $remaining_after === 0 ) {
+        delete_transient('twm_lb_auto_deleted_total');
+        delete_transient('twm_lb_auto_running');
+    }
+
     if ($do_auto) {
         if ($remaining_after > 0) {
-            // Aviso y relanzar próxima tanda
-            echo '<p class="twm-auto-announce"><strong>Auto-borrado en curso…</strong> Eliminados hasta ahora: '
-                . number_format_i18n($auto_total) . '. Restantes estimados: '
-                . number_format_i18n($remaining_after) . '.</p>';
+            // Relanzar próxima tanda con feedback visual
             ?>
             <form id="twm-auto-form" method="post">
                 <?php wp_nonce_field('twm_lb_len'); ?>
@@ -200,27 +292,67 @@ function twm_limpiar_bots_len_page() {
                 <input type="hidden" name="roles_csv"  value="<?php echo esc_attr($roles_csv); ?>">
                 <input type="hidden" name="batch_size" value="<?php echo esc_attr($batch_size); ?>">
                 <input type="hidden" name="do_auto"    value="1">
+                <input type="hidden" name="twm_auto_loop" value="1">
             </form>
             <script>
-            // reenviar en 1200 ms para la próxima tanda
-            setTimeout(function(){ document.getElementById('twm-auto-form').submit(); }, 1200);
+            // Mostrar mensaje de progreso antes de enviar el formulario
+            document.addEventListener('DOMContentLoaded', function() {
+                const progressText = document.getElementById('progress-text');
+                const progressBar = document.getElementById('progress-bar');
+                
+                // Actualizar UI antes de la siguiente tanda
+                progressText.innerHTML = 'Preparando siguiente tanda... <span style="color:#666;font-style:italic;">Por favor espere...</span>';
+                
+                // Pequeña animación de carga
+                let dots = 0;
+                const dotInterval = setInterval(function() {
+                    dots = (dots + 1) % 4;
+                    progressText.innerHTML = 'Preparando siguiente tanda' + '.'.repeat(dots) + ' <span style="color:#666;font-style:italic;">Por favor espere...</span>';
+                }, 300);
+                
+                // Enviar formulario después de un breve retraso
+                setTimeout(function() {
+                    clearInterval(dotInterval);
+                    document.getElementById('twm-auto-form').submit();
+                }, 1000);
+            });
             </script>
             <?php
         } else {
             // Fin del proceso
             $done_total = (int) $auto_total;
             delete_transient('twm_lb_auto_deleted_total');
-            echo '<div class="notice notice-success"><p><strong>Auto-borrado completado.</strong> Total eliminados: '
-                . number_format_i18n($done_total) . '.</p></div>';
+            delete_transient('twm_lb_auto_running');
+            
+            echo '<div class="notice notice-success" style="padding: 15px 20px; margin: 20px 0; border-left: 4px solid #00a32a;">';
+            echo '<h3 style="margin: 0.5em 0; color: #00a32a;">✅ Proceso de limpieza completado con éxito</h3>';
+            echo '<p style="margin: 0.5em 0; font-size: 14px;">';
+            echo 'Se han eliminado un total de <strong>' . number_format_i18n($done_total) . '</strong> usuarios que coincidían con los criterios de búsqueda.';
+            echo '</p>';
+            echo '<p style="margin: 0.5em 0 0; font-size: 13px; color: #646970;">';
+            echo '<em>Puedes verificar los resultados o realizar una nueva búsqueda con diferentes parámetros si es necesario.</em>';
+            echo '</p>';
+            echo '</div>';
+            
+            // Añadir script para scroll suave al mensaje de finalización
+            echo '<script>
+            document.addEventListener("DOMContentLoaded", function() {
+                const notice = document.querySelector(".notice-success");
+                if (notice) {
+                    notice.scrollIntoView({ behavior: "smooth", block: "center" });
+                }
+            });
+            </script>';
         }
     }
-// === Texto explicativo y créditos ===
-echo '<div style="margin-top:20px; padding:12px; border:1px solid #ccc; background:#f9f9f9;">';
-echo '<h2>Acerca de Auto Bot Cleaner</h2>';
-echo '<p>Esta herramienta nació de la necesidad de borrar bots registrados en WordPress que compartían como patrón la presencia de publicidad o contenido sospechoso en alguno de los campos del registro. Para diferenciarlos de los usuarios reales, se utiliza un contador de caracteres en campos clave, permitiendo eliminar únicamente los registros sospechosos sin afectar cuentas legítimas.</p>';
-echo '<p>Si necesitas adaptar esta herramienta a tus necesidades específicas, comunicate con <a href="https://www.tuwebmaster.com.ar" target="_blank">www.tuwebmaster.com.ar</a>.</p>';
-echo '<p style="font-size:12px; color:#666;">&copy; ' . date('Y') . ' TuWebmaster. Todos los derechos reservados.</p>';
-echo '</div>';
+
+    // === Texto explicativo y créditos ===
+    echo '<div style="margin-top:20px; padding:12px; border:1px solid #ccc; background:#f9f9f9;">';
+    echo '<h2>Acerca de Auto Bot Cleaner</h2>';
+    echo '<p>Esta herramienta nació de la necesidad de borrar bots registrados en WordPress que compartían como patrón la presencia de publicidad o contenido sospechoso en alguno de los campos del registro. Para diferenciarlos de los usuarios reales, se utiliza un contador de caracteres en campos clave, permitiendo eliminar únicamente los registros sospechosos sin afectar cuentas legítimas.</p>';
+    echo '<p>Si necesitas adaptar esta herramienta a tus necesidades específicas, comunicate con <a href="https://www.tuwebmaster.com.ar" target="_blank" rel="noopener">www.tuwebmaster.com.ar</a>.</p>';
+    echo '<p style="font-size:12px; color:#666;">&copy; ' . date('Y') . ' TuWebmaster. Todos los derechos reservados.</p>';
+    echo '</div>';
 
     echo '</div>'; // .wrap
 }
